@@ -4,3 +4,4 @@ scipy
 scikit-learn
 onnxruntime
 pydantic
+python-multipart

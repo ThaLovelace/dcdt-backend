@@ -31,11 +31,11 @@
 
 ## Milestone 2 — Data Ingestion & Validation
 
-| Status | Task                                                  |
-|--------|-------------------------------------------------------|
-| 🔲     | Define Pydantic schema for raw stroke input           |
-| 🔲     | Create POST `/api/analyze` endpoint                   |
-| 🔲     | Validate incoming `x`, `y`, `t`, `pressure` data      |
+| Status | Task                                                         |
+|--------|--------------------------------------------------------------|
+| ✅     | Define Pydantic schema for raw stroke input                  |
+| ✅     | Create POST `/api/analyze` endpoint                          |
+| ✅     | Validate incoming `t`, `x`, `y`, `p`, `az`, `alt`, `id` data |
 
 ---
 
@@ -43,9 +43,9 @@
 
 | Status | Task                                                  |
 |--------|-------------------------------------------------------|
-| 🔲     | Implement Savitzky-Golay filter in `core/`            |
-| 🔲     | Implement K-Means clustering in `core/`               |
-| 🔲     | Implement K-Series feature extraction (K1–K5)         |
+| ✅     | Implement Savitzky-Golay filter in `core/`            |
+| ✅     | Implement K-Means clustering in `core/`               |
+| ✅     | Implement K-Series feature extraction (K1–K5)         |
 
 ---
 

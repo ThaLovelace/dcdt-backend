@@ -1,4 +1,5 @@
 # dCDT Backend — Project Overview
+uvicorn main:app --reload
 
 ## Summary
 
@@ -6,14 +7,17 @@ This is a **FastAPI** backend designed to receive raw drawing JSON data from a f
 
 ## Input Data Format
 
-The backend accepts raw stroke data in JSON format with the following fields per data point:
+The backend accepts high-fidelity stroke data in JSON format. The payload is expected to be an object containing a `strokes` array, with the following fields per data point:
 
-| Field      | Type    | Description                          |
-|------------|---------|--------------------------------------|
-| `x`        | float   | X-coordinate of the drawing stroke   |
-| `y`        | float   | Y-coordinate of the drawing stroke   |
-| `t`        | float   | Timestamp of the stroke point (ms)   |
-| `pressure` | float   | Stylus/touch pressure value          |
+| Field | Type  | Description                                        |
+|-------|-------|----------------------------------------------------|
+| `t`   | float | High-resolution monotonic time (e.g., performance.now) in ms |
+| `x`   | float | X-coordinate of the drawing stroke                 |
+| `y`   | float | Y-coordinate of the drawing stroke                 |
+| `p`   | float | Stylus/touch pressure value (0.0 to 1.0)           |
+| `az`  | float | Azimuth angle in radians                           |
+| `alt` | float | Altitude angle in radians                          |
+| `id`  | int   | Global Stroke ID (auto-increments on pen-down)     |
 
 ## Processing Pipeline
 
