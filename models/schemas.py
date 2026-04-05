@@ -36,15 +36,14 @@ class AnalysisRequest(BaseModel):
     image_b64       : Base-64 encoded PNG of the finished canvas (for ViT).
     patient_age     : Used to compute age-adjusted dynamic thresholds.
     education_years : Used to trigger the Education Bias Warning.
-    device_dpi      : Screen DPI reported by the frontend; required to convert
-                      pixel distances to centimetres for K1 and K2.
+    device_dpi      : Hardware screen resolution for physical normalisation.
     """
 
-    strokes:         list[StrokePoint] = Field(..., min_length=1)
-    image_b64:       str               = Field(..., description="Base-64 PNG of canvas")
-    patient_age:     int               = Field(..., ge=0, description="Patient age in years")
-    education_years: int               = Field(..., ge=0, description="Years of formal education")
-    device_dpi:      float             = Field(..., gt=0, description="Device screen DPI")
+    strokes:         list[StrokePoint]
+    image_b64:       str   = Field(..., description="Base-64 encoded PNG")
+    patient_age:     int   = Field(..., ge=0, description="Age in years")
+    education_years: int   = Field(..., ge=0, description="Years of formal education")
+    device_dpi:      float = Field(..., gt=0, description="Device pixels per inch")
 
 
 # ---------------------------------------------------------------------------
@@ -52,26 +51,19 @@ class AnalysisRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 class KinematicResult(BaseModel):
-    """
-    Computed kinematic biomarker values (K1–K5).
+    """Raw, non-normalised biomarker values."""
 
-    A value of None indicates the metric could not be computed, either because
-    the hardware does not support the required sensor, or because the stroke
-    data did not meet the minimum eligibility criteria.
-    """
-
-    K1_rms_cm:             float | None = Field(None, description="RMS tremor deviation (cm)")
-    K2_velocity_cms:       float | None = Field(None, description="Mean drawing velocity (cm/s)")
-    K3_pressure_avg:       float | None = Field(None, description="Mean pen pressure (0–1)")
-    K3_pressure_decrement: float | None = Field(None, description="P_last / P_first ratio")
-    K4_pct_think_time:     float | None = Field(None, description="Percentage of think time (0–100)")
-    K5_pfhl_ms:            float | None = Field(None, description="Pre-first-hand latency (ms)")
-    flags:                 list[str]    = Field(default_factory=list,
-                                                description="Processing flags, e.g. PRESSURE_NOT_SUPPORTED")
+    K1_rms_cm:             float | None = Field(None, description="Tremor: RMS deviation (cm)")
+    K2_velocity_cms:       float | None = Field(None, description="Bradykinesia: Mean velocity (cm/s)")
+    K3_pressure_avg:       float | None = Field(None, description="Micrographia: Mean pressure (0-1)")
+    K3_pressure_decrement: float | None = Field(None, description="Micrographia: P_last / P_first ratio")
+    K4_pct_think_time:     float | None = Field(None, description="Hesitation: % of time spent thinking")
+    K5_pfhl_ms:            float | None = Field(None, description="Pre-first hand latency (ms)")
+    flags:                 list[str]    = Field(default_factory=list, description="Data quality warnings")
 
 
 class DomainResult(BaseModel):
-    """Binary abnormality flags for each clinical domain and individual K-rule."""
+    """Boolean flags for each clinical domain and individual K-rule."""
 
     motor_abnormal:     bool = False
     cognitive_abnormal: bool = False
@@ -96,6 +88,7 @@ class AnalysisResponse(BaseModel):
     domain      : Boolean domain-level and rule-level flags.
     warnings    : List of contextual warnings, e.g. 'EDUCATION_BIAS_WARNING'.
     model_version: Version string of the inference engine used.
+    velocity_profile: List of stroke durations in ms.
     """
 
     class_id:      str            = Field(..., description="Truth-table class, e.g. 'C2'")
@@ -103,6 +96,6 @@ class AnalysisResponse(BaseModel):
     risk_color:    str            = Field(..., description="'green' | 'yellow' | 'red'")
     kinematic:     KinematicResult
     domain:        DomainResult
-    warnings:      list[str]      = Field(default_factory=list,
-                                          description="Contextual warnings for clinicians")
-    model_version: str            = Field(default="mock-vit-v2.0")
+    warnings:      list[str]
+    model_version: str
+    velocity_profile: list[float] = Field(default_factory=list)

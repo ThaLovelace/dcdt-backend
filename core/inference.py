@@ -13,11 +13,17 @@ Responsibilities
 """
 
 from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass   # avoid circular imports at runtime
+
+# ---------------------------------------------------------------------------
+# Import all necessary modules for the orchestrator
+# ---------------------------------------------------------------------------
+from core.preprocessing import process_strokes
+from core.kinematics import extract_all_features, detect_pressure_support
+from core.normalization import get_dynamic_thresholds
 
 # ---------------------------------------------------------------------------
 # Risk level mapping (spec §3.5.5.2, Table 3.4)
@@ -38,6 +44,7 @@ _RISK_MAP: dict[str, tuple[str, str]] = {
 _EDUCATION_WARNING_CLASSES: frozenset[str] = frozenset({"C4", "C5", "C6", "C7"})
 EDUCATION_BIAS_WARNING = "EDUCATION_BIAS_WARNING"
 
+
 # ---------------------------------------------------------------------------
 # Step 1: Evaluate K-Series against thresholds
 # ---------------------------------------------------------------------------
@@ -52,26 +59,6 @@ def evaluate_k_series(
     A feature that is ``None`` (hardware not supported, or insufficient
     data) is treated as **not triggered** — it does not contribute an
     abnormal signal.
-
-    Parameters
-    ----------
-    features:
-        Output of ``kinematics.extract_all_features``.
-    thresholds:
-        Output of ``normalization.get_dynamic_thresholds``.
-
-    Returns
-    -------
-    dict[str, bool]
-        ``{"K1": bool, "K2": bool, "K3": bool, "K4": bool, "K5": bool}``
-
-    Rules (spec §3.5.4.3, Table 3.2)
-    ----------------------------------
-    K1 : RMS > K1_rms_threshold_cm
-    K2 : velocity < K2_velocity_cms
-    K3 : (P_avg < K3_pressure_avg) OR (P_decrement < K3_decrement_ratio)
-    K4 : %ThinkTime > K4_pct_think_time
-    K5 : PFHL_ms > K5_pfhl_ms
     """
     def _val(key: str) -> "float | None":
         return features.get(key)
@@ -116,24 +103,6 @@ def apply_truth_table(
 ) -> str:
     """
     Map the three binary domain signals to a truth-table class C0–C7.
-
-    Domain definitions (spec §3.5.5.1)
-    ------------------------------------
-    * S_Motor : K1 OR K2 OR K3
-    * S_Cog   : K4 OR K5
-    * S_AI    : structural ViT result (mocked as a heuristic here)
-
-    Truth table
-    -----------
-    AI  Motor  Cog  →  Class
-    N    N      N   →  C0
-    N    Y      N   →  C1
-    N    N      Y   →  C2
-    N    Y      Y   →  C3
-    Y    N      N   →  C4
-    Y    N      Y   →  C5
-    Y    Y      N   →  C6
-    Y    Y      Y   →  C7
     """
     index = (
         (4 if ai_abnormal    else 0)
@@ -165,29 +134,6 @@ def classify_risk(
 ) -> dict:
     """
     Convert the truth-table class to a 3-tier risk level and collect warnings.
-
-    Education Bias Warning (spec §3.5.5.1, note 4)
-    -----------------------------------------------
-    If ``education_years < 8`` **and** ``class_id ∈ {C4, C5, C6, C7}``,
-    append ``"EDUCATION_BIAS_WARNING"`` to the warnings list.
-
-    The system does **not** auto-downgrade the risk level (No Auto-
-    Downgrading policy) to prevent false negatives in low-education
-    patients who may have genuine dementia (Rossetti et al., 2011).
-
-    Parameters
-    ----------
-    class_id:
-        Output of ``apply_truth_table``.
-    education_years:
-        Years of formal education from the request.
-    extra_warnings:
-        Any warnings already accumulated upstream (e.g. from kinematics).
-
-    Returns
-    -------
-    dict
-        ``{class_id, risk_level, risk_color, warnings}``
     """
     risk_level, risk_color = _RISK_MAP.get(class_id, ("unknown", "grey"))
 
@@ -211,15 +157,6 @@ def classify_risk(
 def _mock_ai_structural_result(features: dict) -> tuple[bool, float]:
     """
     Heuristic mock for the ViT structural analysis.
-
-    In production this function is replaced by ONNX Runtime inference.
-    The mock triggers an AI abnormal signal when cognitive biomarkers
-    suggest severe impairment, matching the heuristic described in
-    the original mock spec.
-
-    Returns
-    -------
-    (ai_abnormal, confidence_score)
     """
     k4 = features.get("K4_pct_think_time") or 0.0
     k5 = features.get("K5_pfhl_ms")        or 0.0
@@ -234,54 +171,82 @@ def _mock_ai_structural_result(features: dict) -> tuple[bool, float]:
 # ---------------------------------------------------------------------------
 
 def run_analysis(
-    features:        dict,
-    thresholds:      dict,
+    strokes: list,
+    image_b64: str,
+    age: int,
     education_years: int,
+    device_dpi: float
 ) -> dict:
     """
-    Full clinical decision pipeline: K-series → domains → truth table → risk.
-
-    Parameters
-    ----------
-    features:
-        Output of ``kinematics.extract_all_features``.
-    thresholds:
-        Output of ``normalization.get_dynamic_thresholds``.
-    education_years:
-        From the ``AnalysisRequest``.
-
-    Returns
-    -------
-    dict
-        ``{class_id, risk_level, risk_color, warnings, domain, confidence}``
+    Full clinical decision pipeline orchestrator.
+    Expects raw payload data, extracts features, and runs clinical logic.
     """
-    # 1. Evaluate individual K-rules
+    # 1. Check if the device hardware provides meaningful pressure data
+    pressure_supported = detect_pressure_support(strokes)
+
+    # 2. Pre-processing: Apply Savitzky-Golay smoothing and eligibility filtering
+    processed_summary = process_strokes(strokes)
+
+    # EXTRACT TIMELINE DATA HERE
+    timeline_data = []
+    if "processed_strokes" in processed_summary:
+        timeline_data = [
+            stroke["duration_ms"] 
+            for stroke in processed_summary["processed_strokes"] 
+            if stroke["duration_ms"] > 0
+        ]
+
+    # 3. Kinematic Feature Extraction (K1-K5)
+    features = extract_all_features(
+        raw_strokes=strokes,
+        processed_summary=processed_summary,
+        device_dpi=device_dpi,
+        pressure_supported=pressure_supported
+    )
+    
+    # 4. Get Age-Adjusted Thresholds
+    thresholds = get_dynamic_thresholds(age)
+
+    # 5. Evaluate individual K-rules
     k_results = evaluate_k_series(features, thresholds)
 
-    # 2. Aggregate into domain signals
+    # 6. Aggregate into domain signals
     motor_abnormal = k_results["K1"] or k_results["K2"] or k_results["K3"]
     cog_abnormal   = k_results["K4"] or k_results["K5"]
     ai_abnormal, confidence = _mock_ai_structural_result(features)
 
-    # 3. Map to C0–C7
+    # 7. Map to Truth Table C0–C7
     class_id = apply_truth_table(ai_abnormal, motor_abnormal, cog_abnormal)
 
-    # 4. Risk level + education warning
+    # 8. Risk level + education warning
     upstream_warnings = features.get("flags", [])
     result = classify_risk(class_id, education_years, upstream_warnings)
 
-    # 5. Attach domain-level detail for the response schema
-    result["domain"] = {
-        "motor_abnormal":     motor_abnormal,
-        "cognitive_abnormal": cog_abnormal,
-        "ai_abnormal":        ai_abnormal,
-        "k1_triggered":       k_results["K1"],
-        "k2_triggered":       k_results["K2"],
-        "k3_triggered":       k_results["K3"],
-        "k4_triggered":       k_results["K4"],
-        "k5_triggered":       k_results["K5"],
+    # 9. Format the exact response expected by schemas.AnalysisResponse
+    return {
+        "class_id": result["class_id"],
+        "risk_level": result["risk_level"],
+        "risk_color": result["risk_color"],
+        "kinematic": {
+            "K1_rms_cm": features.get("K1_rms_cm"),
+            "K2_velocity_cms": features.get("K2_velocity_cms"),
+            "K3_pressure_avg": features.get("K3_pressure_avg"),
+            "K3_pressure_decrement": features.get("K3_pressure_decrement"),
+            "K4_pct_think_time": features.get("K4_pct_think_time"),
+            "K5_pfhl_ms": features.get("K5_pfhl_ms"),
+            "flags": features.get("flags", [])
+        },
+        "domain": {
+            "motor_abnormal":     motor_abnormal,
+            "cognitive_abnormal": cog_abnormal,
+            "ai_abnormal":        ai_abnormal,
+            "k1_triggered":       k_results["K1"],
+            "k2_triggered":       k_results["K2"],
+            "k3_triggered":       k_results["K3"],
+            "k4_triggered":       k_results["K4"],
+            "k5_triggered":       k_results["K5"],
+        },
+        "warnings": result["warnings"],
+        "model_version": "mock-vit-v2.0",
+        "velocity_profile": timeline_data
     }
-    result["confidence"] = confidence
-    result["model_version"] = "mock-vit-v2.0"
-
-    return result
