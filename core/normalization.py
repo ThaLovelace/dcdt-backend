@@ -33,16 +33,21 @@ def _threshold_k2(age: int) -> float:
 
     Formula (spec §3.5.4.4)::
 
-        max(0.3,  1.2 − (0.005 × age))
+        max(0.5,  3.0 − (0.03 × max(0, age − 60)))
 
-    Velocity decreases linearly with age across all age groups.
-    The lower bound of **0.3 cm/s** prevents the threshold from
-    dropping to zero or negative for very high age values.
+    Velocity decreases linearly with age **only past age 60** (age-60 decay),
+    reflecting population-level norms for older adults.  The lower bound of
+    **0.5 cm/s** prevents over-triggering at extreme ages.
+
+    BUG-002 FIX: Previous formula used max(0.3, 1.2-(0.005*age)) which had
+    a wrong baseline (0.3 vs 0.5), wrong intercept (1.2 vs 3.0), wrong slope
+    (0.005 vs 0.03), and wrong age anchor (age vs age-60).
 
     References: Müller et al. (2019).
     """
-    raw = 1.2 - (0.005 * age)
-    return max(0.3, raw)
+    age_above_60 = max(0, age - 60)
+    raw = 3.0 - (0.03 * age_above_60)
+    return max(0.5, raw)
 
 
 def _threshold_k4(age: int) -> float:
@@ -51,14 +56,20 @@ def _threshold_k4(age: int) -> float:
 
     Formula (spec §3.5.4.4)::
 
-        25.0 + (0.2 × max(age, 30))
+        40 + (3.0 × floor((age − 60) / 10))
 
-    Increases by 0.2 % per year of age.
+    Increases by 3.0 % per decade past age 60; clamped to a minimum of 40 %.
+    Below age 60 the step term is zero so the threshold is a flat 40 %.
+
+    BUG-003 FIX: Previous formula used 25.0 + (0.2 * max(age, 30)) which had
+    wrong baseline (25 vs 40), wrong slope (0.2/year vs 3.0/decade), wrong
+    age anchor (age/30 vs decade steps past 60), and produced values far above
+    the clinical spec for middle-aged patients.
 
     References: Souillard-Mandar et al. (2016).
     """
-    effective_age = max(age, 30)
-    return 25.0 + (0.2 * effective_age)
+    decades_past_60 = max(0, math.floor((age - 60) / 10))
+    return 40.0 + (3.0 * decades_past_60)
 
 
 def _threshold_k5(age: int) -> float:

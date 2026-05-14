@@ -351,16 +351,88 @@ def _stroke_is_clock_hand(
     threshold_radius: float,
 ) -> bool:
     """
-    Return True when the stroke centroid lies within *threshold_radius*
-    of the canvas centre (centroid-based classifier for robustness).
+    Multi-feature clock-hand classifier with override rule (spec §3.5.4.4).
+
+    BUG-005 FIX: Previous implementation used only centroid distance, which
+    misclassifies short digit strokes near the centre and long hand strokes
+    whose centroid drifts to the periphery.
+
+    Classification criteria (ALL features evaluated, override rule applied):
+
+    Feature 1 — Centroid proximity:
+        centroid distance to canvas centre <= threshold_radius  →  hand_vote
+
+    Feature 2 — Stroke passes through centre zone:
+        any point within (threshold_radius * 0.6) of centre  →  hand_vote
+
+    Feature 3 — Arc length (relative to canvas diagonal):
+        arc_length >= 0.15 * bbox_diagonal  →  hand_vote
+        arc_length <  0.05 * bbox_diagonal  →  digit_vote  (short tick/mark)
+
+    Override rule (spec §3.5.4.4, note on segmentation):
+        • If arc_length < 0.04 * bbox_diagonal  →  force DIGIT regardless of votes
+          (protects against tiny pen-down artefacts being promoted as hands)
+        • If feature-2 fires AND arc_length >= 0.20 * bbox_diagonal  →  force HAND
+          (a long stroke passing through the centre is almost certainly a hand)
+
+    A stroke is classified as a hand when hand_votes >= 2 out of 3 features
+    (majority vote), subject to the override rules above.
     """
     if not points:
         return False
 
+    # --- Geometry helpers ------------------------------------------------
     centroid_x = sum(pt.x for pt in points) / len(points)
     centroid_y = sum(pt.y for pt in points) / len(points)
-    distance   = math.sqrt((centroid_x - center_x) ** 2 + (centroid_y - center_y) ** 2)
-    return distance <= threshold_radius
+    centroid_dist = math.sqrt((centroid_x - center_x) ** 2 + (centroid_y - center_y) ** 2)
+
+    # Arc length of this stroke
+    arc_px = 0.0
+    for i in range(1, len(points)):
+        dx = points[i].x - points[i - 1].x
+        dy = points[i].y - points[i - 1].y
+        arc_px += math.sqrt(dx * dx + dy * dy)
+
+    # Canvas diagonal (proxy for scale); threshold_radius is already 25 % of
+    # min(bbox_w, bbox_h), so bbox_diagonal ≈ threshold_radius / 0.25 * sqrt(2).
+    # We keep the scale factor relative to threshold_radius for robustness.
+    bbox_diagonal = threshold_radius / 0.25 * math.sqrt(2)
+
+    # --- Feature votes ---------------------------------------------------
+    # Feature 1: centroid proximity
+    f1_hand = centroid_dist <= threshold_radius
+
+    # Feature 2: passes through centre zone
+    centre_zone_r = threshold_radius * 0.6
+    f2_hand = any(
+        math.sqrt((pt.x - center_x) ** 2 + (pt.y - center_y) ** 2) <= centre_zone_r
+        for pt in points
+    )
+
+    # Feature 3: arc length relative to canvas diagonal
+    if arc_px >= 0.15 * bbox_diagonal:
+        f3_hand = True
+    elif arc_px < 0.05 * bbox_diagonal:
+        f3_hand = False
+    else:
+        f3_hand = None  # neutral — no vote cast
+
+    # --- Override rules (applied before majority vote) -------------------
+    # Hard digit override: stroke too short to be a hand
+    if arc_px < 0.04 * bbox_diagonal:
+        return False
+
+    # Hard hand override: long stroke passing through centre
+    if f2_hand and arc_px >= 0.20 * bbox_diagonal:
+        return True
+
+    # --- Majority vote (hand_votes >= 2) ---------------------------------
+    hand_votes = sum([
+        1 if f1_hand else 0,
+        1 if f2_hand else 0,
+        1 if f3_hand is True else 0,
+    ])
+    return hand_votes >= 2
 
 
 def _compute_k5_pre_first_hand_latency(
@@ -448,20 +520,27 @@ def _compute_k5_pre_first_hand_latency(
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None, seg_log
 
-    t_start_first_hand = classifications[first_hand_index][2]
+    # BUG-004 FIX: PFHL is defined as:
+    #   PFHL = t_hand_start − t_digit_end
+    # where t_hand_start is the timestamp of the FIRST point of the first
+    # classified hand stroke, and t_digit_end is the timestamp of the LAST
+    # point of the last digit stroke that precedes it.
+    # The old (wrong) approach anchored to session/global start which caused
+    # latency values to accumulate all preceding drawing time.
+    t_hand_start = classifications[first_hand_index][2]   # t_start of first hand stroke
 
-    t_end_last_digit: float | None = None
+    t_digit_end: float | None = None
     for idx in range(first_hand_index - 1, -1, -1):
         _, is_hand, _, t_end = classifications[idx]
         if not is_hand:
-            t_end_last_digit = t_end
+            t_digit_end = t_end   # t_end of last digit stroke before first hand
             break
 
-    if t_end_last_digit is None:
+    if t_digit_end is None:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None, seg_log
 
-    latency_ms = t_start_first_hand - t_end_last_digit
+    latency_ms = t_hand_start - t_digit_end  # PFHL = t_hand_start − t_digit_end
 
     if latency_ms < 0:
         flags.append(DRAWING_ORDER_ANOMALY_FLAG)

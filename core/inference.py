@@ -75,14 +75,17 @@ def evaluate_k_series(features: dict, thresholds: dict) -> dict[str, bool]:
     """
     Compare each kinematic feature value against its clinical threshold.
     """
-    K1_RMS_THRESHOLD_CM: float = 0.03
+    # BUG-001 FIX: Removed hardcoded K1_RMS_THRESHOLD_CM = 0.03 and the
+    # min(...) clamp that prevented the spec-correct 0.05 cm threshold from
+    # being used.  The threshold now comes exclusively from get_dynamic_thresholds()
+    # which returns K1_RMS_THRESHOLD_CM = 0.05 per spec §3.5.4.4.
 
     def _val(key: str) -> "float | None":
         return features.get(key)
 
     # K1
     k1_val = _val("K1_rms_cm")
-    k1_threshold = min(thresholds.get("K1_rms_threshold_cm", K1_RMS_THRESHOLD_CM), K1_RMS_THRESHOLD_CM)
+    k1_threshold = thresholds.get("K1_rms_threshold_cm", 0.05)  # spec: RMS > 0.05 cm
     k1 = (k1_val is not None) and (k1_val > k1_threshold)
 
     # K2
