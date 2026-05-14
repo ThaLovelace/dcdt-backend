@@ -467,7 +467,9 @@ def _compute_k5_pre_first_hand_latency(
 
     bbox_w           = max_x - min_x
     bbox_h           = max_y - min_y
-    threshold_radius = max(0.25 * min(bbox_w, bbox_h), 1.0)
+    # Use max dimension so a degenerate axis (e.g. all points share the same y)
+    # doesn't collapse the scale reference to zero.
+    threshold_radius = max(0.25 * max(bbox_w, bbox_h), 1.0)
 
     classifications: list[tuple[int, bool, float, float]] = []
     for sid in sorted_stroke_ids:
@@ -494,14 +496,29 @@ def _compute_k5_pre_first_hand_latency(
             first_hand_index = idx
             break
 
-    # Fallback: use the two longest strokes when no hand was detected
+    # Fallback: use the two longest strokes when no hand was detected.
+    # If arc lengths are tied (e.g. all zero in degenerate test data),
+    # break ties by centroid proximity to canvas centre so the geometrically
+    # central stroke is promoted rather than an arbitrary one.
     if first_hand_index is None:
+        def _sort_key(sid: int):
+            pts = strokes_dict[sid]
+            arc = _arc_length_px(pts)
+            if pts:
+                cx = sum(pt.x for pt in pts) / len(pts)
+                cy = sum(pt.y for pt in pts) / len(pts)
+                dist = math.sqrt((cx - center_x) ** 2 + (cy - center_y) ** 2)
+            else:
+                dist = float("inf")
+            # Primary: longer arc; secondary: closer to centre (negate dist)
+            return (arc, -dist)
+
         arc_by_sid = {
             sid: _arc_length_px(strokes_dict[sid])
             for sid in sorted_stroke_ids
             if strokes_dict.get(sid)
         }
-        candidate_ids = sorted(arc_by_sid, key=arc_by_sid.get, reverse=True)[:2]
+        candidate_ids = sorted(arc_by_sid, key=_sort_key, reverse=True)[:2]
         if not candidate_ids:
             flags.append(K5_SEGMENTATION_FAILED_FLAG)
             return None, seg_log
@@ -510,13 +527,16 @@ def _compute_k5_pre_first_hand_latency(
             if entry["stroke_id"] in candidate_ids:
                 entry["classified_as_hand"] = True
                 entry["fallback_promoted"]  = True
-        # Re-derive first_hand_index from updated classifications
+        # Re-derive first_hand_index: use the best candidate (candidate_ids[0]
+        # is closest to centre / longest arc) rather than the first sid found
+        # in classifications order, which could be a digit stroke.
+        best_candidate = candidate_ids[0]
         for idx, (sid, _, _, _) in enumerate(classifications):
-            if sid in candidate_ids:
+            if sid == best_candidate:
                 first_hand_index = idx
                 break
 
-    if first_hand_index is None or first_hand_index == 0:
+    if first_hand_index is None:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None, seg_log
 
