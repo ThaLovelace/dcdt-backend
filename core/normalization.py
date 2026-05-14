@@ -31,41 +31,41 @@ def _threshold_k2(age: int) -> float:
     """
     Minimum drawing velocity threshold for K2 (Bradykinesia) in cm/s.
 
-    Formula (spec §3.5.4.4 (1))::
+    Formula (spec §3.5.4.4)::
 
-        max(0.5,  3.0 − (0.03 × max(0, age − 60)))
+        max(0.3,  1.2 − (0.005 × age))
 
-    The lower bound of **0.5 cm/s** guards against:
-    * Near-akinesia states that prevent test completion.
-    * Data-entry errors producing extreme age values (e.g. 999).
+    Velocity decreases linearly with age across all age groups.
+    The lower bound of **0.3 cm/s** prevents the threshold from
+    dropping to zero or negative for very high age values.
 
-    References: Müller et al. (2019) — ~0.03 cm/s/year decline for age ≥ 60.
+    References: Müller et al. (2019).
     """
-    raw = 3.0 - (0.03 * max(0, age - 60))
-    return max(0.5, raw)
+    raw = 1.2 - (0.005 * age)
+    return max(0.3, raw)
 
 
 def _threshold_k4(age: int) -> float:
     """
     %ThinkTime threshold for K4 (Hesitation) as a percentage.
 
-    Formula (spec §3.5.4.4 (2))::
+    Formula (spec §3.5.4.4)::
 
-        40.0 + (3.0 × max(0, floor((age − 60) / 10)))
+        25.0 + (0.2 × max(age, 30))
 
-    Increases by 3 % per decade past age 60.
+    Increases by 0.2 % per year of age.
 
-    References: Souillard-Mandar et al. (2016) — ~3 %/decade increase.
+    References: Souillard-Mandar et al. (2016).
     """
-    decades = max(0, math.floor((age - 60) / 10))
-    return 40.0 + (3.0 * decades)
+    effective_age = max(age, 30)
+    return 25.0 + (0.2 * effective_age)
 
 
 def _threshold_k5(age: int) -> float:
     """
     Pre-First Hand Latency threshold for K5 in milliseconds.
 
-    Formula (spec §3.5.4.4 (3))::
+    Formula (spec §3.5.4.4)::
 
         8000 + (1500 × max(0, floor((age − 60) / 10)))
 
@@ -112,7 +112,6 @@ def get_dynamic_thresholds(age: int) -> dict:
             }
     """
     if age <= 0:
-        # Treat as healthy young adult to avoid negative thresholds
         effective_age = 30
     else:
         effective_age = age

@@ -7,6 +7,13 @@ Each public function computes one biomarker family and returns None when
 the data are insufficient or the hardware does not provide the required
 sensor signal.  The orchestrator ``extract_all_features`` calls them in
 order and assembles the final feature dict consumed by ``inference.py``.
+
+K1 Dual-Trajectory Architecture
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+K1 tremor is measured as RMS( raw − Trajectory B ) where Trajectory B
+is the "stiff" reference (350 ms window, poly=2) built in preprocessing.
+This correctly isolates tremor oscillations from intended movement.
+Trajectory A (50 ms, poly=3) is used only for K2 velocity.
 """
 
 from __future__ import annotations
@@ -23,37 +30,42 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 
-K4_NOISE_FILTER_MS: float = 500.0   # Gaps shorter than this are ignored (spec §3.5.4.3)
-DRAWING_ORDER_ANOMALY_FLAG = "DRAWING_ORDER_ANOMALY"
-PRESSURE_NOT_SUPPORTED_FLAG = "PRESSURE_NOT_SUPPORTED"
-K5_SEGMENTATION_FAILED_FLAG = "K5_SEGMENTATION_FAILED"
+K4_NOISE_FILTER_MS: float = 500.0
+DRAWING_ORDER_ANOMALY_FLAG   = "DRAWING_ORDER_ANOMALY"
+PRESSURE_NOT_SUPPORTED_FLAG  = "PRESSURE_NOT_SUPPORTED"
+K5_SEGMENTATION_FAILED_FLAG  = "K5_SEGMENTATION_FAILED"
 
 
 # ---------------------------------------------------------------------------
-# K1 — Tremor (RMS deviation)
+# K1 — Tremor (RMS deviation from Trajectory B)
 # ---------------------------------------------------------------------------
 
 def compute_k1_rms(
-    raw_x:      list[float],
-    raw_y:      list[float],
-    smoothed_x: list[float],
-    smoothed_y: list[float],
+    raw_x:    list[float],
+    raw_y:    list[float],
+    stiff_x:  list[float],
+    stiff_y:  list[float],
     device_dpi: float,
 ) -> float | None:
     """
-    Compute K1: per-stroke RMS deviation of raw from smoothed trajectory.
+    Compute K1: per-stroke RMS deviation of raw from Trajectory B (stiff reference).
 
-    Formula (spec §3.5.4.1)::
+    Dual-Trajectory Architecture (spec §3.5.4.1)::
 
-        RMS_px  = sqrt( (1/N) * Σ [(xi − x̂i)² + (yi − ŷi)²] )
+        RMS_px  = sqrt( (1/N) * Σ [(xi − x̂B_i)² + (yi − ŷB_i)²] )
         RMS_cm  = RMS_px / (device_dpi / 2.54)
+
+    Trajectory B is built with a 350 ms window and polyorder=2 so it
+    follows the intended drawing direction without bending into tremor
+    oscillations (4–8 Hz).  Subtracting raw from this stiff reference
+    correctly isolates the tremor component.
 
     Parameters
     ----------
     raw_x, raw_y:
         Original pixel coordinates captured from the canvas.
-    smoothed_x, smoothed_y:
-        Savitzky-Golay smoothed coordinates (same length as raw).
+    stiff_x, stiff_y:
+        Trajectory B — stiff reference coordinates (same length as raw).
     device_dpi:
         Device screen resolution in dots per inch.
 
@@ -63,48 +75,45 @@ def compute_k1_rms(
         RMS deviation in centimetres.
     None
         Returned when any guard condition is triggered:
-        * ``len(raw_x) != len(smoothed_x)`` — array length mismatch
-          (structural guarantee from preprocessing, but validated here
-          as a defensive check).
+        * ``len(raw_x) != len(stiff_x)`` — array length mismatch.
         * ``len(raw_x) == 0`` — empty stroke.
         * ``device_dpi <= 0`` — invalid DPI.
 
     Raises
     ------
     ValueError
-        If ``len(raw_x) != len(smoothed_x)`` — indicates a bug upstream.
+        If ``len(raw_x) != len(stiff_x)`` — indicates a bug upstream.
     """
-    # Guard: invalid DPI
     if device_dpi <= 0:
         return None
 
-    # Guard: empty arrays
     if len(raw_x) == 0:
         return None
 
-    # Guard: 1-to-1 mapping requirement
-    if len(raw_x) != len(smoothed_x) or len(raw_y) != len(smoothed_y):
+    # Guard: 1-to-1 mapping requirement (raw vs Trajectory B)
+    if len(raw_x) != len(stiff_x) or len(raw_y) != len(stiff_y):
         raise ValueError(
             f"Array length mismatch in compute_k1_rms: "
             f"raw=({len(raw_x)}, {len(raw_y)}) "
-            f"smoothed=({len(smoothed_x)}, {len(smoothed_y)}). "
+            f"stiff=({len(stiff_x)}, {len(stiff_y)}). "
             "Down-sampling or point deletion must never be applied."
         )
 
-    raw_x_arr  = np.asarray(raw_x,      dtype=float)
-    raw_y_arr  = np.asarray(raw_y,      dtype=float)
-    sm_x_arr   = np.asarray(smoothed_x, dtype=float)
-    sm_y_arr   = np.asarray(smoothed_y, dtype=float)
+    raw_x_arr  = np.asarray(raw_x,   dtype=float)
+    raw_y_arr  = np.asarray(raw_y,   dtype=float)
+    stiff_x_arr = np.asarray(stiff_x, dtype=float)
+    stiff_y_arr = np.asarray(stiff_y, dtype=float)
 
-    sq_dev     = (raw_x_arr - sm_x_arr) ** 2 + (raw_y_arr - sm_y_arr) ** 2
-    rms_px     = float(np.sqrt(np.mean(sq_dev)))
+    # RMS deviation between raw and Trajectory B
+    sq_dev  = (raw_x_arr - stiff_x_arr) ** 2 + (raw_y_arr - stiff_y_arr) ** 2
+    rms_px  = float(np.sqrt(np.mean(sq_dev)))
 
-    px_per_cm  = device_dpi / 2.54
+    px_per_cm = device_dpi / 2.54
     return rms_px / px_per_cm
 
 
 # ---------------------------------------------------------------------------
-# K2 — Bradykinesia (average velocity)
+# K2 — Bradykinesia (average velocity from Trajectory A path length)
 # ---------------------------------------------------------------------------
 
 def compute_k2_velocity(
@@ -114,7 +123,11 @@ def compute_k2_velocity(
     """
     Compute K2: mean drawing velocity across all kinematic-eligible strokes.
 
-    Formula (spec §3.5.4.1)::
+    Uses ``path_length_px`` which is pre-computed from **Trajectory A**
+    (smoothed coordinates) in preprocessing to prevent tremor inflation
+    (spec §3.5.4.2).
+
+    Formula::
 
         total_length_cm = Σ path_length_px / px_per_cm
         total_time_s    = Σ duration_ms / 1000
@@ -164,17 +177,6 @@ def detect_pressure_support(all_strokes: list["StrokePoint"]) -> bool:
     A constant pressure value (std < 0.01) or all-zero pressure indicates
     that the device does not support the Pointer Events pressure API and
     K3 should be skipped entirely (spec §3.5.4.1 footnote).
-
-    Parameters
-    ----------
-    all_strokes:
-        Every ``StrokePoint`` in the session.
-
-    Returns
-    -------
-    bool
-        True  — pressure varies; hardware is supported.
-        False — pressure is constant or zero; K3 must be skipped.
     """
     if not all_strokes:
         return False
@@ -191,8 +193,8 @@ def detect_pressure_support(all_strokes: list["StrokePoint"]) -> bool:
 
 
 def compute_k3_pressure(
-    strokes_dict:      dict[int, list["StrokePoint"]],
-    sorted_stroke_ids: list[int],
+    strokes_dict:       dict[int, list["StrokePoint"]],
+    sorted_stroke_ids:  list[int],
     pressure_supported: bool,
 ) -> dict:
     """
@@ -202,21 +204,6 @@ def compute_k3_pressure(
     over all points in the first and last stroke respectively** — never
     a single data point — to reduce the effect of sensor noise
     (spec §3.5.4.3, note 3).
-
-    Parameters
-    ----------
-    strokes_dict:
-        Mapping stroke_id → list[StrokePoint].
-    sorted_stroke_ids:
-        Chronologically ordered stroke IDs.
-    pressure_supported:
-        Output of ``detect_pressure_support``.  If False, all fields
-        are returned as None.
-
-    Returns
-    -------
-    dict
-        ``{"P_avg": float|None, "P_first": float|None, "P_last": float|None}``
     """
     empty = {"P_avg": None, "P_first": None, "P_last": None}
 
@@ -257,53 +244,29 @@ def compute_k4_think_time(
     Definitions (spec §3.5.4.2)::
 
         T_ink   = Σ (t_end − t_start) for every stroke
-        T_think = Σ gap_i  where gap_i = next.t_start − curr.t_end
-                            and gap_i > t_noise_ms   (strictly greater)
-                            Gaps ≤ t_noise_ms or negative are ignored.
+        T_think = Σ gap_i  where gap_i > t_noise_ms (strictly greater)
         T_total = T_ink + T_think
         %ThinkTime = (T_think / T_total) × 100
-
-    Parameters
-    ----------
-    strokes_dict:
-        Mapping stroke_id → list[StrokePoint], points already in time order.
-    sorted_stroke_ids:
-        Chronologically ordered stroke IDs.
-    t_noise_ms:
-        Minimum gap duration to be counted as cognitive hesitation (default
-        500 ms per Souillard-Mandar et al., 2016).
-
-    Returns
-    -------
-    dict
-        ``{T_ink_ms, T_think_ms, T_total_ms, pct_think_time}``
-    None
-        Returned immediately when ``T_total <= 0`` to prevent
-        division by zero (spec §3.5.4.3 defensive guard).
     """
     if not sorted_stroke_ids:
         return None
 
-    # --- Accumulate T_ink -----------------------------------------------
     T_ink: float = 0.0
     for sid in sorted_stroke_ids:
         pts = strokes_dict[sid]
         if len(pts) >= 2:
             T_ink += pts[-1].t - pts[0].t
 
-    # --- Accumulate T_think (only gaps > t_noise_ms) --------------------
     T_think: float = 0.0
     for i in range(len(sorted_stroke_ids) - 1):
         current_end = strokes_dict[sorted_stroke_ids[i]][-1].t
         next_start  = strokes_dict[sorted_stroke_ids[i + 1]][0].t
         gap = next_start - current_end
-        if gap > t_noise_ms:       # strictly greater — equal is ignored
+        if gap > t_noise_ms:
             T_think += gap
-        # gap <= t_noise_ms (including negative timestamps) → ignored
 
     T_total = T_ink + T_think
 
-    # --- Defensive guard: prevent division by zero ----------------------
     if T_total <= 0:
         return None
 
@@ -358,19 +321,6 @@ def _compute_k5_pre_first_hand_latency(
 ) -> float | None:
     """
     Compute K5: time between the last digit stroke and the first hand stroke.
-
-    Returns
-    -------
-    float
-        PFHL in milliseconds (clamped to 0.0 when the patient drew hands
-        before digits; ``DRAWING_ORDER_ANOMALY`` is appended to *flags*).
-    None
-        Returned — and ``K5_SEGMENTATION_FAILED`` appended to *flags* — in
-        every edge case where a meaningful latency cannot be determined:
-        * empty input
-        * no hand stroke found
-        * no digit stroke precedes the first hand stroke
-        * the first stroke in the session is already a hand
     """
     if not strokes_dict or not sorted_stroke_ids:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
@@ -385,18 +335,14 @@ def _compute_k5_pre_first_hand_latency(
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None
 
-    # Bounding box → canvas centre
     min_x, max_x, min_y, max_y = _compute_bounding_box(all_points)
     center_x = (min_x + max_x) / 2.0
     center_y = (min_y + max_y) / 2.0
 
-    # Threshold radius: 25 % of the smaller bounding dimension (floor 1 px)
     bbox_w            = max_x - min_x
     bbox_h            = max_y - min_y
     threshold_radius  = max(0.25 * min(bbox_w, bbox_h), 1.0)
 
-    # Classify each stroke and record temporal boundaries
-    # Each entry: (stroke_id, is_hand, t_start, t_end)
     classifications: list[tuple[int, bool, float, float]] = []
     for sid in sorted_stroke_ids:
         pts = strokes_dict[sid]
@@ -411,7 +357,6 @@ def _compute_k5_pre_first_hand_latency(
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None
 
-    # Find first hand stroke
     first_hand_index: int | None = None
     for idx, (_, is_hand, _, _) in enumerate(classifications):
         if is_hand:
@@ -423,13 +368,11 @@ def _compute_k5_pre_first_hand_latency(
         return None
 
     if first_hand_index == 0:
-        # First stroke is already a hand — no preceding digit exists
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
         return None
 
     t_start_first_hand = classifications[first_hand_index][2]
 
-    # Find the last digit/face stroke before the first hand
     t_end_last_digit: float | None = None
     for idx in range(first_hand_index - 1, -1, -1):
         _, is_hand, _, t_end = classifications[idx]
@@ -444,7 +387,6 @@ def _compute_k5_pre_first_hand_latency(
     latency_ms = t_start_first_hand - t_end_last_digit
 
     if latency_ms < 0:
-        # Patient drew hands before digits; clamp and flag
         flags.append(DRAWING_ORDER_ANOMALY_FLAG)
         return 0.0
 
@@ -464,22 +406,9 @@ def extract_all_features(
     """
     Orchestrate K1–K5 extraction and return a unified feature dict.
 
-    Parameters
-    ----------
-    raw_strokes:
-        All original ``StrokePoint`` objects from the request.
-    processed_summary:
-        Output of ``preprocessing.process_strokes``.
-    device_dpi:
-        Device DPI for pixel→cm conversion (K1, K2).
-    pressure_supported:
-        Output of ``detect_pressure_support``.
-
-    Returns
-    -------
-    dict
-        Keys: K1_rms_cm, K2_velocity_cms, K3_pressure_avg,
-              K3_pressure_decrement, K4_pct_think_time, K5_pfhl_ms, flags.
+    K1 now uses ``stiff_x`` / ``stiff_y`` (Trajectory B) from
+    ``processed_summary`` as the reference for RMS tremor measurement.
+    K2 uses ``path_length_px`` which is pre-computed from Trajectory A.
     """
     flags: list[str] = []
 
@@ -502,7 +431,7 @@ def extract_all_features(
         strokes_dict.setdefault(pt.id, []).append(pt)
     sorted_stroke_ids = sorted(strokes_dict.keys())
 
-    # --- K1: RMS tremor -------------------------------------------------
+    # --- K1: RMS tremor (raw vs Trajectory B / stiff reference) ---------
     k1_rms_values: list[float] = []
     for stroke in processed_strokes:
         if not stroke.get("eligible_for_kinematics"):
@@ -511,21 +440,20 @@ def extract_all_features(
             rms = compute_k1_rms(
                 stroke["raw_x"],
                 stroke["raw_y"],
-                stroke["smoothed_x"],
-                stroke["smoothed_y"],
+                stroke["stiff_x"],   # Trajectory B — stiff reference
+                stroke["stiff_y"],
                 device_dpi,
             )
             if rms is not None:
                 k1_rms_values.append(rms)
         except ValueError as exc:
-            # Array mismatch — should never occur if preprocessing is correct
             flags.append(f"K1_ARRAY_MISMATCH: {exc}")
 
     k1_rms_cm: float | None = (
         float(np.mean(k1_rms_values)) if k1_rms_values else None
     )
 
-    # --- K2: Velocity ---------------------------------------------------
+    # --- K2: Velocity (path_length already from Trajectory A) -----------
     k2_velocity_cms = compute_k2_velocity(processed_strokes, device_dpi)
 
     # --- K3: Pressure ---------------------------------------------------

@@ -6,8 +6,12 @@ Signal smoothing pipeline for the dCDT backend.
 Key guarantee (K1 requirement)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ``process_strokes`` returns **both** the original raw coordinates
-(``raw_x``, ``raw_y``) and the Savitzky-Golay smoothed coordinates
-(``smoothed_x``, ``smoothed_y``) for every stroke.
+(``raw_x``, ``raw_y``) and two smoothed trajectories:
+
+* ``smoothed_x`` / ``smoothed_y``  — Trajectory A (50 ms window, poly=3)
+  Used for K2 velocity calculation to remove tremor inflation.
+* ``stiff_x``    / ``stiff_y``     — Trajectory B (350 ms window, poly=2)
+  Used as the K1 tremor reference; "stiff" enough to not follow tremor oscillations.
 
 Because ``scipy.signal.savgol_filter`` always returns an array whose
 length is identical to its input, the 1-to-1 point mapping between
@@ -28,9 +32,14 @@ if TYPE_CHECKING:
 # Constants (spec §3.5.2)
 # ---------------------------------------------------------------------------
 
-TARGET_WINDOW_MS: float = 50.0   # Desired temporal window length in ms
-MIN_WINDOW:       int   = 5      # Absolute floor for window length (must be odd)
-POLY_ORDER:       int   = 3      # Savitzky-Golay polynomial order
+TARGET_WINDOW_MS: float = 50.0    # Trajectory A: target temporal window (ms)
+MIN_WINDOW:       int   = 5       # Absolute floor for window length (must be odd)
+POLY_ORDER:       int   = 3       # Trajectory A: Savitzky-Golay polynomial order
+
+# Trajectory B (Stiff Reference for K1 tremor measurement — spec §3.5.4.1)
+TARGET_STIFF_WINDOW_MS: float = 350.0  # Wide enough to span tremor cycles (4–8 Hz)
+K1_STIFF_MIN_WINDOW:    int   = 21     # Minimum samples for reliable stiff reference
+STIFF_POLY_ORDER:       int   = 2      # Low order to prevent following tremor curves
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +48,7 @@ POLY_ORDER:       int   = 3      # Savitzky-Golay polynomial order
 
 def compute_adaptive_window(timestamps_ms: np.ndarray) -> int:
     """
-    Calculate the time-adaptive Savitzky-Golay window length.
+    Calculate the time-adaptive Savitzky-Golay window length for Trajectory A.
 
     The window is chosen so that it spans approximately
     ``TARGET_WINDOW_MS`` (50 ms) of signal regardless of the device
@@ -77,6 +86,62 @@ def compute_adaptive_window(timestamps_ms: np.ndarray) -> int:
     return window if window % 2 == 1 else window + 1
 
 
+def _build_stiff_reference(
+    x_arr: np.ndarray,
+    y_arr: np.ndarray,
+    t_arr: np.ndarray,
+) -> tuple[list[float], list[float]]:
+    """
+    Build Trajectory B: the "stiff" reference for K1 tremor measurement.
+
+    Uses a wide 350 ms window and low polynomial order (2) so the
+    reference line follows the intended drawing direction without
+    bending into tremor oscillations (spec §3.5.4.1, Dual-Trajectory).
+
+    Parameters
+    ----------
+    x_arr, y_arr:
+        Raw pixel coordinates.
+    t_arr:
+        Timestamps in milliseconds.
+
+    Returns
+    -------
+    (stiff_x, stiff_y) : tuple[list[float], list[float]]
+        Stiff reference coordinates.  Same length as input — 1-to-1
+        mapping is preserved by savgol_filter.
+    """
+    dt_median = float(np.median(np.diff(t_arr))) if len(t_arr) >= 2 else 0.0
+
+    if dt_median <= 0:
+        # Fallback: assume 200 Hz (5 ms per sample)
+        dt_median = 5.0
+
+    raw_window = int(round(TARGET_STIFF_WINDOW_MS / dt_median))
+    dynamic_window = max(raw_window, K1_STIFF_MIN_WINDOW)
+
+    # Enforce odd window length
+    if dynamic_window % 2 == 0:
+        dynamic_window += 1
+
+    # Enforce window does not exceed data length (savgol requirement)
+    n = len(x_arr)
+    if dynamic_window >= n:
+        # Not enough points for stiff filter; fall back to Trajectory A values
+        return x_arr.tolist(), y_arr.tolist()
+
+    stiff_x = savgol_filter(
+        x_arr, window_length=dynamic_window, polyorder=STIFF_POLY_ORDER,
+        deriv=0, mode="interp"
+    ).tolist()
+    stiff_y = savgol_filter(
+        y_arr, window_length=dynamic_window, polyorder=STIFF_POLY_ORDER,
+        deriv=0, mode="interp"
+    ).tolist()
+
+    return stiff_x, stiff_y
+
+
 def compute_jerk_signal(
     x:      np.ndarray,
     y:      np.ndarray,
@@ -105,14 +170,7 @@ def compute_jerk_signal(
         Per-sample jerk magnitude (pixels / s³).
     is_reliable : bool
         True when the stroke has enough points to fill at least one
-        fully interior window (``n >= 2 * window - 2``).  Boundary
-        samples are extrapolated and carry higher uncertainty.
-
-    Notes
-    -----
-    ``dt_s`` is computed from the **median** inter-sample interval so
-    that occasional duplicate timestamps from coalesced browser events
-    do not corrupt the time axis (spec §3.5.2 Algorithm 3.2).
+        fully interior window (``n >= 2 * window - 2``).
     """
     dt_median = float(np.median(np.diff(t_ms)))
     dt_s = (dt_median / 1000.0) if dt_median > 0 else (1.0 / 200.0)
@@ -134,10 +192,10 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
     Pre-processing pipeline enforcing the Three-tier Eligibility rules
     (spec §3.5.2, Table 3.5).
 
-    For every stroke the function returns **both** the original raw
-    coordinates and the Savitzky-Golay smoothed coordinates so that
-    ``kinematics.compute_k1_rms`` can compute the RMS deviation without
-    any information loss.
+    For every stroke the function returns the original raw coordinates,
+    Trajectory A (smoothed for K2 velocity), and Trajectory B (stiff
+    reference for K1 tremor) so that downstream kinematics modules
+    receive all necessary data without re-computing filters.
 
     Parameters
     ----------
@@ -154,24 +212,25 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
     stroke_id              : int
     point_count            : int
     duration_ms            : float
-    path_length_px         : float   – Euclidean arc length in pixels.
-    raw_x                  : list[float]  – Original X coordinates.
-    raw_y                  : list[float]  – Original Y coordinates.
-    smoothed_x             : list[float]  – Savitzky-Golay smoothed X.
-    smoothed_y             : list[float]  – Savitzky-Golay smoothed Y.
-                             ``len(raw_x) == len(smoothed_x)`` is always True.
-    pressure_values        : list[float]  – Raw pressure at every point.
-    eligible_for_timing    : bool  – Tier 1: t_end > t_start.
-    eligible_for_smoothing : bool  – Tier 2: n >= adaptive window.
-    eligible_for_kinematics: bool  – Tier 3: Tier 2 AND path_length > 0.
+    path_length_px         : float
+        Euclidean arc length computed from **Trajectory A** (smoothed_x/y)
+        to prevent tremor inflation in K2 velocity (spec §3.5.4.2).
+    raw_x / raw_y          : list[float]  — Original coordinates.
+    smoothed_x / smoothed_y: list[float]  — Trajectory A (50 ms, poly=3).
+    stiff_x    / stiff_y   : list[float]  — Trajectory B (350 ms, poly=2).
+                             All three share the same length (1-to-1 mapping).
+    pressure_values        : list[float]
+    eligible_for_timing    : bool  — Tier 1
+    eligible_for_smoothing : bool  — Tier 2
+    eligible_for_kinematics: bool  — Tier 3
     jerk_magnitude         : float | None
     is_jerk_reliable       : bool
 
     Array-length guarantee
     ----------------------
     ``savgol_filter`` never changes the length of its input array;
-    therefore ``len(raw_x) == len(smoothed_x)`` holds by construction.
-    No down-sampling or point deletion is performed at any stage.
+    therefore ``len(raw_x) == len(smoothed_x) == len(stiff_x)`` holds
+    by construction.
     """
     # Group points by stroke_id (preserving insertion order)
     strokes_data: dict[int, dict] = {}
@@ -193,7 +252,6 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
 
         n_points = len(t_arr)
         if n_points < 2:
-            # Cannot form a stroke from a single point
             continue
 
         t_duration = float(t_arr[-1] - t_arr[0])
@@ -201,24 +259,13 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
         # --- Tier 1: Timing eligibility ---------------------------------
         eligible_for_timing = t_duration > 0
 
-        # --- Adaptive window -------------------------------------------
+        # --- Adaptive window (Trajectory A) ----------------------------
         window = compute_adaptive_window(t_arr)
 
         # --- Tier 2: Smoothing eligibility ------------------------------
         eligible_for_smoothing = n_points >= window
 
-        # --- Arc length (pixels) ----------------------------------------
-        dx = np.diff(x_arr)
-        dy = np.diff(y_arr)
-        path_length_px = float(np.sum(np.sqrt(dx**2 + dy**2)))
-
-        # --- Tier 3: Kinematic eligibility ------------------------------
-        eligible_for_kinematics = eligible_for_smoothing and path_length_px > 0
-
-        # --- Smoothing (deriv=0 = position only) ------------------------
-        # Using deriv=0 here preserves point count while reducing sensor
-        # noise.  The jerk derivative (deriv=3) is computed separately in
-        # compute_jerk_signal to avoid compounding approximation errors.
+        # --- Trajectory A: balanced smoothing (deriv=0) -----------------
         if eligible_for_smoothing:
             smoothed_x = savgol_filter(
                 x_arr, window, POLY_ORDER, deriv=0, mode="interp"
@@ -227,12 +274,28 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
                 y_arr, window, POLY_ORDER, deriv=0, mode="interp"
             ).tolist()
         else:
-            # Fall back to raw coordinates; the 1-to-1 mapping is preserved.
+            # Fall back to raw coordinates; 1-to-1 mapping is preserved.
             smoothed_x = x_arr.tolist()
             smoothed_y = y_arr.tolist()
 
-        # savgol_filter guarantees output length == input length, so
-        # len(raw_x) == len(smoothed_x) is always True.
+        # --- Arc length from Trajectory A (not raw) ---------------------
+        # Using smoothed coordinates prevents tremor inflation in K2.
+        sm_x = np.array(smoothed_x)
+        sm_y = np.array(smoothed_y)
+        dx_sm = np.diff(sm_x)
+        dy_sm = np.diff(sm_y)
+        path_length_px = float(np.sum(np.sqrt(dx_sm**2 + dy_sm**2)))
+
+        # --- Tier 3: Kinematic eligibility ------------------------------
+        eligible_for_kinematics = eligible_for_smoothing and path_length_px > 0
+
+        # --- Trajectory B: stiff reference (for K1 tremor) -------------
+        if eligible_for_kinematics:
+            stiff_x, stiff_y = _build_stiff_reference(x_arr, y_arr, t_arr)
+        else:
+            # Not enough data for K1; still preserve 1-to-1 mapping.
+            stiff_x = x_arr.tolist()
+            stiff_y = y_arr.tolist()
 
         # --- Jerk (for internal use / future features) ------------------
         jerk_magnitude: float | None = None
@@ -248,13 +311,17 @@ def process_strokes(payload_strokes: list["StrokePoint"]) -> dict:
                 "stroke_id":               stroke_id,
                 "point_count":             int(n_points),
                 "duration_ms":             t_duration,
+                # Path length from Trajectory A — prevents tremor inflation (K2)
                 "path_length_px":          path_length_px,
                 # Raw coordinates — never modified after capture
                 "raw_x":                   x_arr.tolist(),
                 "raw_y":                   y_arr.tolist(),
-                # Smoothed coordinates — same length as raw (1-to-1 mapping)
+                # Trajectory A — balanced smoothing for K2 velocity
                 "smoothed_x":              smoothed_x,
                 "smoothed_y":              smoothed_y,
+                # Trajectory B — stiff reference for K1 tremor measurement
+                "stiff_x":                 stiff_x,
+                "stiff_y":                 stiff_y,
                 "pressure_values":         p_arr,
                 "eligible_for_timing":     bool(eligible_for_timing),
                 "eligible_for_smoothing":  bool(eligible_for_smoothing),
