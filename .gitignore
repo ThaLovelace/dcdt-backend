@@ -6,3 +6,4 @@ venv/
 env/
 .env/
 models/*.pth
+dcdt-vit-model/

@@ -34,6 +34,7 @@ K4_NOISE_FILTER_MS: float = 500.0
 DRAWING_ORDER_ANOMALY_FLAG   = "DRAWING_ORDER_ANOMALY"
 PRESSURE_NOT_SUPPORTED_FLAG  = "PRESSURE_NOT_SUPPORTED"
 K5_SEGMENTATION_FAILED_FLAG  = "K5_SEGMENTATION_FAILED"
+K5_FALLBACK_USED_FLAG        = "K5_FALLBACK_LONGEST_STROKES"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,41 @@ def compute_k1_rms(
 # K2 — Bradykinesia (average velocity from Trajectory A path length)
 # ---------------------------------------------------------------------------
 
+def _arc_length_px(points: list["StrokePoint"]) -> float:
+    """
+    Euclidean arc-length of a raw stroke in pixels.
+
+    Used by K5 fallback when the classifier cannot identify any hand strokes;
+    the two longest strokes (by raw arc-length) are promoted as candidates.
+    """
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(points)):
+        dx = points[i].x - points[i - 1].x
+        dy = points[i].y - points[i - 1].y
+        total += math.sqrt(dx * dx + dy * dy)
+    return total
+
+
+def _smoothed_arc_length_px(
+    smoothed_x: list[float],
+    smoothed_y: list[float],
+) -> float:
+    """
+    Euclidean arc-length of a balanced-smoothed stroke (Trajectory A).
+
+    Using smoothed rather than raw coordinates prevents tremor artefacts
+    from inflating the measured path length and deflating velocity
+    (Souillard-Mandar et al., 2016, §3.2).
+    """
+    if len(smoothed_x) < 2:
+        return 0.0
+    sx = np.asarray(smoothed_x, dtype=float)
+    sy = np.asarray(smoothed_y, dtype=float)
+    return float(np.sum(np.sqrt(np.diff(sx) ** 2 + np.diff(sy) ** 2)))
+
+
 def compute_k2_velocity(
     processed_strokes: list[dict],
     device_dpi:        float,
@@ -151,14 +187,27 @@ def compute_k2_velocity(
     if device_dpi <= 0:
         return None
 
-    px_per_cm     = device_dpi / 2.54
-    total_len_cm  = 0.0
-    total_time_s  = 0.0
+    px_per_cm    = device_dpi / 2.54
+    total_len_cm = 0.0
+    total_time_s = 0.0
 
     for stroke in processed_strokes:
-        if stroke.get("eligible_for_kinematics"):
-            total_len_cm += stroke["path_length_px"] / px_per_cm
-            total_time_s += stroke["duration_ms"] / 1000.0
+        if not stroke.get("eligible_for_kinematics"):
+            continue
+        duration_s = stroke["duration_ms"] / 1000.0
+        if duration_s <= 0:
+            continue
+
+        if "smoothed_x" in stroke and "smoothed_y" in stroke:
+            arc_px = _smoothed_arc_length_px(stroke["smoothed_x"], stroke["smoothed_y"])
+        else:
+            arc_px = stroke.get("path_length_px", 0.0)
+
+        if arc_px <= 0:
+            continue
+
+        total_len_cm += arc_px / px_per_cm
+        total_time_s += duration_s
 
     if total_time_s <= 0:
         return None
@@ -318,13 +367,18 @@ def _compute_k5_pre_first_hand_latency(
     strokes_dict:      dict[int, list["StrokePoint"]],
     sorted_stroke_ids: list[int],
     flags:             list[str],
-) -> float | None:
+) -> tuple[float | None, list[dict]]:
     """
     Compute K5: time between the last digit stroke and the first hand stroke.
+
+    Returns a tuple of (latency_ms, seg_log) for compatibility with the
+    audit-log contract expected by the orchestrator and any diagnostic routes.
     """
+    seg_log: list[dict] = []
+
     if not strokes_dict or not sorted_stroke_ids:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        return None, seg_log
 
     all_points: list["StrokePoint"] = [
         pt
@@ -333,29 +387,34 @@ def _compute_k5_pre_first_hand_latency(
     ]
     if not all_points:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        return None, seg_log
 
     min_x, max_x, min_y, max_y = _compute_bounding_box(all_points)
     center_x = (min_x + max_x) / 2.0
     center_y = (min_y + max_y) / 2.0
 
-    bbox_w            = max_x - min_x
-    bbox_h            = max_y - min_y
-    threshold_radius  = max(0.25 * min(bbox_w, bbox_h), 1.0)
+    bbox_w           = max_x - min_x
+    bbox_h           = max_y - min_y
+    threshold_radius = max(0.25 * min(bbox_w, bbox_h), 1.0)
 
     classifications: list[tuple[int, bool, float, float]] = []
     for sid in sorted_stroke_ids:
         pts = strokes_dict[sid]
         if not pts:
             continue
-        t_start  = pts[0].t
-        t_end    = pts[-1].t
-        is_hand  = _stroke_is_clock_hand(pts, center_x, center_y, threshold_radius)
+        t_start = pts[0].t
+        t_end   = pts[-1].t
+        is_hand = _stroke_is_clock_hand(pts, center_x, center_y, threshold_radius)
         classifications.append((sid, is_hand, t_start, t_end))
+        seg_log.append({
+            "stroke_id":          sid,
+            "classified_as_hand": is_hand,
+            "fallback_promoted":  False,
+        })
 
     if not classifications:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        return None, seg_log
 
     first_hand_index: int | None = None
     for idx, (_, is_hand, _, _) in enumerate(classifications):
@@ -363,13 +422,31 @@ def _compute_k5_pre_first_hand_latency(
             first_hand_index = idx
             break
 
+    # Fallback: use the two longest strokes when no hand was detected
     if first_hand_index is None:
-        flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        arc_by_sid = {
+            sid: _arc_length_px(strokes_dict[sid])
+            for sid in sorted_stroke_ids
+            if strokes_dict.get(sid)
+        }
+        candidate_ids = sorted(arc_by_sid, key=arc_by_sid.get, reverse=True)[:2]
+        if not candidate_ids:
+            flags.append(K5_SEGMENTATION_FAILED_FLAG)
+            return None, seg_log
+        flags.append(K5_FALLBACK_USED_FLAG)
+        for entry in seg_log:
+            if entry["stroke_id"] in candidate_ids:
+                entry["classified_as_hand"] = True
+                entry["fallback_promoted"]  = True
+        # Re-derive first_hand_index from updated classifications
+        for idx, (sid, _, _, _) in enumerate(classifications):
+            if sid in candidate_ids:
+                first_hand_index = idx
+                break
 
-    if first_hand_index == 0:
+    if first_hand_index is None or first_hand_index == 0:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        return None, seg_log
 
     t_start_first_hand = classifications[first_hand_index][2]
 
@@ -382,15 +459,15 @@ def _compute_k5_pre_first_hand_latency(
 
     if t_end_last_digit is None:
         flags.append(K5_SEGMENTATION_FAILED_FLAG)
-        return None
+        return None, seg_log
 
     latency_ms = t_start_first_hand - t_end_last_digit
 
     if latency_ms < 0:
         flags.append(DRAWING_ORDER_ANOMALY_FLAG)
-        return 0.0
+        return 0.0, seg_log
 
-    return float(latency_ms)
+    return float(latency_ms), seg_log
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +498,7 @@ def extract_all_features(
             "K4_pct_think_time":     None,
             "K5_pfhl_ms":            None,
             "flags":                 flags,
+            "k5_segmentation_log":   [],
         }
 
     processed_strokes = processed_summary.get("processed_strokes", [])
@@ -472,7 +550,7 @@ def extract_all_features(
     k4_pct_think    = k4_result["pct_think_time"] if k4_result is not None else None
 
     # --- K5: PFHL -------------------------------------------------------
-    k5_pfhl_ms = _compute_k5_pre_first_hand_latency(
+    k5_pfhl_ms, seg_log = _compute_k5_pre_first_hand_latency(
         strokes_dict, sorted_stroke_ids, flags
     )
     if k5_pfhl_ms is None and K5_SEGMENTATION_FAILED_FLAG not in flags:
@@ -486,4 +564,5 @@ def extract_all_features(
         "K4_pct_think_time":     k4_pct_think,
         "K5_pfhl_ms":            k5_pfhl_ms,
         "flags":                 flags,
+        "k5_segmentation_log":   seg_log,
     }
