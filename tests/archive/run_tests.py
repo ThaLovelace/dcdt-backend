@@ -19,18 +19,34 @@ def run(name, fn):
 
 # ── imports ──────────────────────────────────────────────────────────────────
 import math, numpy as np
-from kinematics import (
+from core.kinematics import (
     compute_k1_rms, compute_k2_velocity,
     detect_pressure_support, compute_k3_pressure,
     compute_k4_think_time,
     _compute_k5_pre_first_hand_latency,
 )
-from normalization import get_dynamic_thresholds
-from inference import evaluate_k_series, apply_truth_table, classify_risk, EDUCATION_BIAS_WARNING
+from core.normalization import get_dynamic_thresholds
+from core.inference import evaluate_k_series, apply_truth_table, classify_risk, EDUCATION_BIAS_WARNING, run_analysis
 
 class SP:  # StrokePoint stub
     def __init__(self, t, x, y, p=0.5, az=0.0, alt=1.57, id=1):
         self.t=t; self.x=x; self.y=y; self.p=p; self.az=az; self.alt=alt; self.id=id
+
+
+# ── Orchestrator (run_analysis) ──────────────────────────────────────────────
+print("\n── Orchestrator (run_analysis) ──")
+
+def t_run_analysis_schema():
+    strokes = [SP(t=i*10, x=i*2, y=0, id=1) for i in range(20)]
+    result = run_analysis(strokes, "base64_mock", 70, 12, 96.0)
+    
+    expected_keys = {"class_id", "risk_level", "risk_color", "kinematic", "domain", "warnings", "model_version", "velocity_profile"}
+    missing = expected_keys - set(result.keys())
+    assert not missing, f"Missing keys in response: {missing}"
+    assert isinstance(result["velocity_profile"], list), "velocity_profile must be a list"
+
+run("Orchestrator::schema_match", t_run_analysis_schema)
+
 
 # ── K1 tests ─────────────────────────────────────────────────────────────────
 print("\n── K1 ──")
@@ -60,6 +76,7 @@ for name,fn in [("array_mismatch_raises",t_k1_mismatch),
                 ("known_deviation",t_k1_known)]:
     run(f"K1::{name}", fn)
 
+
 # ── K2 tests ─────────────────────────────────────────────────────────────────
 print("\n── K2 ──")
 def _ps(path,dur): return [{"eligible_for_kinematics":True,"path_length_px":path,"duration_ms":dur}]
@@ -77,6 +94,7 @@ def t_k2_excludes_ineligible():
 for name,fn in [("zero_duration_none",t_k2_zero_dur),("bad_dpi_none",t_k2_bad_dpi),
                 ("unit_conversion",t_k2_unit),("excludes_ineligible",t_k2_excludes_ineligible)]:
     run(f"K2::{name}", fn)
+
 
 # ── K3 tests ─────────────────────────────────────────────────────────────────
 print("\n── K3 ──")
@@ -105,6 +123,7 @@ for name,fn in [("constant_not_supported",t_k3_constant_not_supported),
                 ("stroke_averages",t_k3_stroke_averages),
                 ("none_when_unsupported",t_k3_none_when_unsupported)]:
     run(f"K3::{name}", fn)
+
 
 # ── K4 tests ─────────────────────────────────────────────────────────────────
 print("\n── K4 ──")
@@ -158,6 +177,7 @@ for name,fn in [("gap_300_ignored",t_k4_gap_300_ignored),
                 ("pct_calculation",t_k4_pct_calculation)]:
     run(f"K4::{name}", fn)
 
+
 # ── K5 tests ─────────────────────────────────────────────────────────────────
 print("\n── K5 ──")
 def t_k5_empty_none():
@@ -191,6 +211,7 @@ for name,fn in [("empty_returns_none",t_k5_empty_none),
                 ("drawing_order_anomaly",t_k5_drawing_order_anomaly)]:
     run(f"K5::{name}", fn)
 
+
 # ── Normalization ─────────────────────────────────────────────────────────────
 print("\n── Normalization ──")
 cases_k2 = [(60,3.00),(70,2.70),(80,2.40),(90,2.10),(100,1.80)]
@@ -210,6 +231,7 @@ for age,exp in cases_k4:
 for age,exp in cases_k5:
     run(f"Norm::K5_age{age}", lambda a=age,e=exp: (lambda t: None if abs(t["K5_pfhl_ms"]-e)<1e-5 else (_ for _ in ()).throw(AssertionError(f"{t['K5_pfhl_ms']} != {e}")))(get_dynamic_thresholds(a)))
 
+
 # ── Truth table ───────────────────────────────────────────────────────────────
 print("\n── Truth Table ──")
 tt_cases=[(False,False,False,"C0"),(False,True,False,"C1"),(False,False,True,"C2"),
@@ -217,6 +239,7 @@ tt_cases=[(False,False,False,"C0"),(False,True,False,"C1"),(False,False,True,"C2
           (True,True,False,"C6"),(True,True,True,"C7")]
 for ai,mo,cg,exp in tt_cases:
     run(f"TT::{exp}", lambda a=ai,m=mo,c=cg,e=exp: None if apply_truth_table(a,m,c)==e else (_ for _ in ()).throw(AssertionError(f"{apply_truth_table(a,m,c)} != {e}")))
+
 
 # ── Education warning ─────────────────────────────────────────────────────────
 print("\n── Education Warning ──")
@@ -233,6 +256,7 @@ def t_no_auto_downgrade():
     r=classify_risk("C4",4)
     assert r["risk_level"]=="mild" and r["risk_color"]=="yellow"
 run("EduWarn::no_auto_downgrade", t_no_auto_downgrade)
+
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*55}")

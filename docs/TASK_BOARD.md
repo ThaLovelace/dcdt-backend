@@ -54,8 +54,8 @@
 | Status | Task                                                  |
 |--------|-------------------------------------------------------|
 | 🔲     | Integrate ViT-B/16 ONNX model                         |
-| 🔲     | Create inference pipeline in `core/`                  |
-| 🔲     | Return structured scoring result to frontend          |
+| ✅     | Create inference pipeline in `core/`                  |
+| ✅     | Return structured scoring result to frontend          |
 
 ---
 

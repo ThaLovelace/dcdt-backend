@@ -8,11 +8,7 @@ app = FastAPI(title="dCDT Backend API")
 app.add_middleware(
     CORSMiddleware,
     # Replace "*" with the EXACT URL of your frontend(s)
-    allow_origins=[
-        "http://localhost:3001",    # Your local desktop browser
-        "http://127.0.0.1:3001",    
-        "http://172.20.10.4:3001",  # Your local network IP (great for testing on a tablet!)
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -99,3 +99,7 @@ class AnalysisResponse(BaseModel):
     warnings:      list[str]
     model_version: str
     velocity_profile: list[float] = Field(default_factory=list)
+    # --- New Fields ---
+    ai_confidence: float = Field(..., description="Model probability score 0.0-1.0")
+    processed_image_b64: str | None = Field(None, description="The centered image used for ViT")
+    xai_evidence_b64: str | None = None

@@ -1,7 +1,13 @@
 fastapi
 uvicorn
-scipy
-scikit-learn
-onnxruntime
 pydantic
 python-multipart
+scipy
+scikit-learn
+scikit-image
+onnxruntime
+opencv-python-headless
+torch
+torchvision
+huggingface_hub
+timm

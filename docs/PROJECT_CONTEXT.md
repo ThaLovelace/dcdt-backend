@@ -1,5 +1,7 @@
 # dCDT Backend — Project Overview
 uvicorn main:app --reload
+python -m pytest tests/ --ignore=tests/archive/ -v
+
 
 ## Summary
 

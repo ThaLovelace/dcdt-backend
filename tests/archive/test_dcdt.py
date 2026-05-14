@@ -15,6 +15,7 @@ Coverage
 * Normalization — dynamic threshold formulae + lower bound (age = 999)
 * Education Bias Warning — triggered / not triggered matrix
 * Truth table — all 8 C0–C7 combinations
+* Orchestrator — full pipeline execution and schema verification (v2.0)
 """
 
 from __future__ import annotations
@@ -59,6 +60,58 @@ def _make_stroke(n: int = 20, x_start: float = 0.0, y_start: float = 0.0,
         )
         for i in range(n)
     ]
+
+
+# ===========================================================================
+# Orchestrator — run_analysis (Integration & Schema Match)
+# ===========================================================================
+
+class TestRunAnalysis:
+
+    def _import(self):
+        from core.inference import run_analysis
+        return run_analysis
+
+    def test_end_to_end_payload_structure(self):
+        """
+        Ensures the orchestrator outputs the exact dictionary structure
+        required by the schemas.AnalysisResponse Pydantic model.
+        (Specifically checks for the newly added 'velocity_profile').
+        """
+        run_analysis = self._import()
+        strokes = _make_stroke(20, dt=10) # 20 points, 10ms apart
+        
+        result = run_analysis(
+            strokes=strokes,
+            image_b64="mock_base64_string",
+            age=70,
+            education_years=12,
+            device_dpi=96.0
+        )
+        
+        # Check top-level keys
+        expected_keys = {
+            "class_id", "risk_level", "risk_color", "kinematic",
+            "domain", "warnings", "model_version", "velocity_profile"
+        }
+        assert expected_keys.issubset(result.keys()), "Missing required keys in response"
+        
+        # Verify velocity_profile is a list (populated by process_strokes)
+        assert isinstance(result["velocity_profile"], list)
+        
+        # Verify nested kinematic keys
+        kinematic_keys = {
+            "K1_rms_cm", "K2_velocity_cms", "K3_pressure_avg",
+            "K3_pressure_decrement", "K4_pct_think_time", "K5_pfhl_ms", "flags"
+        }
+        assert kinematic_keys.issubset(result["kinematic"].keys())
+        
+        # Verify nested domain keys
+        domain_keys = {
+            "motor_abnormal", "cognitive_abnormal", "ai_abnormal",
+            "k1_triggered", "k2_triggered", "k3_triggered", "k4_triggered", "k5_triggered"
+        }
+        assert domain_keys.issubset(result["domain"].keys())
 
 
 # ===========================================================================
